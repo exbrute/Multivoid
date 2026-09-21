@@ -263,14 +263,20 @@ bool EnsureHeldItemBroadcast(void* heldActor, coop::net::Session* s) {
     std::wstring keyStr = ue_wrap::prop::GetInteractableKeyString(heldActor);
     if (!keyStr.empty() && keyStr != L"None" &&
         PT::GetPropElementIdForActor(heldActor) != coop::element::kInvalidId) {
-        // Logged with key and eid: "the pose stream suffices" holds only while the prop is actively
-        // held and streamed, so a repro can tell a tracker-known decline from a never-received
-        // spawn.
-        UE_LOGI("[ROCK-DROP] EnsureHeldItemBroadcast DECLINE (tracker-known): cls='%ls' key='%ls' eid=%u "
-                "-- 'pose stream suffices' assumes an active stream; false if the prop is no longer held",
+        // The world identity and pose already exist, but the actor's own save state may have
+        // changed in the hand. Food is the concrete case: its remaining uses are mutated on the
+        // live actor, then a handoff/pocket/drop keeps the same tracked key. Returning here without
+        // a record left the host's older value canonical, so the next mirror was full again.
+        // Publish at both callers' edges (new-held and release): the first transfers the state the
+        // new holder received, the second transfers any uses consumed while they held it. Classes
+        // without leaf save state are a cheap Covers() miss.
+        const bool statePublished = coop::prop_save_data::Publish(s, heldActor, keyStr);
+        UE_LOGI("[ROCK-DROP] EnsureHeldItemBroadcast tracker-known: cls='%ls' key='%ls' eid=%u "
+                "-- pose stream suffices; mutable save record %s",
                 R::ClassNameOf(heldActor).c_str(), keyStr.c_str(),
-                static_cast<unsigned>(PT::GetPropElementIdForActor(heldActor)));
-        return false;  // keyed AND tracker-known: the peer has it; pose stream suffices
+                static_cast<unsigned>(PT::GetPropElementIdForActor(heldActor)),
+                statePublished ? "published" : "not covered/refused");
+        return statePublished;  // no PropSpawn needed; true means the mutable record was expressed
     }
 
     const std::wstring cls = R::ClassNameOf(heldActor);
