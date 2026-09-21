@@ -252,7 +252,7 @@ own re-take is touched and an ejecting peer behaves exactly as it does in single
 | the balance | the host | one-way, absolute, on change |
 | an order | the client names the row; the host performs and prices | an intent |
 | a coin gun sale | the client names the prop; the host prices, mints and destroys | an intent ahead of the destroy |
-| a device's floppy slot | the host | a 1 Hz digest-gated poll; a peer claims the outcome of its own insert or eject, and the host's canonical is the answer |
+| a device's floppy slot | the host | a 20 Hz digest-gated poll; a peer claims the outcome of its own insert or eject, and the host's canonical is the answer |
 
 ## Wire messages
 
@@ -295,7 +295,7 @@ an error line.
 | The coin collect has two entries; the interceptor sits on the overlap entry, and the E-press entry dispatches inside the Blueprint where it cannot fire, so a coin a client collects by pressing is credited on the client only and the host's next balance broadcast erases it | `[V]` `coop/items/coingun_sync` |
 | A client's earnings from anything but the drone and the coin gun (a point sack, a chest, an achievement) reach only its own machine and are erased by the host's next broadcast | `[V]` `coop/world/balance_sync` is one-way |
 | A client's light-group index has been reported dropping to zero after a join; not reproduced | `[?]` [issue 11](https://github.com/VOTV-MP/Multivoid/issues/11) |
-| A slot change reaches the other peer on the next poll, so up to a second plus the round trip. A player who reaches a box inside that window acts on the slot as it was: an eject of a disc the other peer has just inserted answers "No floppy disc in the slot" and is not retried | `[V]` the lane polls at 1 Hz; a faster poll would narrow the window rather than close it |
+| Slot verbs are optimistic because the game's insert/eject calls cannot be cancelled at their internal dispatch. A simultaneous conflicting action can therefore still race the host's canonical; ordinary sequential use converges on the 20 Hz poll plus one round trip | `[V]` the slot lane and the unhookable `EX_LocalVirtualFunction` verbs |
 
 ## Code map
 

@@ -32,7 +32,11 @@ namespace GT = ue_wrap::game_thread;
 
 std::atomic<coop::net::Session*> g_session{nullptr};
 
-constexpr uint64_t kSweepMs = 1000;   // the server lane's own cadence
+// This is an interaction edge, not background telemetry. At one second a player could insert on
+// one peer and press eject on another before that peer had ever seen the occupied slot; the native
+// eject then permanently answered "empty". ReadDigest is allocation-free and stops at floppyType
+// for empty slots, so 20 Hz is cheap while closing that human-scale race window.
+constexpr uint64_t kSweepMs = 50;
 
 // The identity is the device's index in its kind's own list, and the list is the gamemode's
 // servers[]: the level places the boxes, so both peers build the same order. The cap is
@@ -168,6 +172,14 @@ std::set<uint32_t> g_unsendable;     // slots this peer cannot put on the wire a
 // its last save. Prime and stay mute until the host has spoken.
 bool g_haveCanonical = false;
 
+// A canonical can arrive on the world-ready edge before the gamemode has populated its servers[]
+// list on this peer. Dropping it and setting g_haveCanonical was especially destructive: the next
+// poll treated the joiner's stale save as a local edit and claimed it over the host. Keep the
+// newest host value per device until that exact device exists locally. The map is intrinsically
+// bounded by (device kinds * kMaxDevices), so unlike a chunk assembly this state needs no expiry:
+// dropping it would recreate the divergence it exists to prevent.
+std::map<uint32_t, Slot> g_pendingCanonical;
+
 // CLIENT: a claim the host drops -- for its rate, its size, a bad index or a malformed body --
 // gets no answer of any kind, and this peer primed its shadow when the claim was SENT. Without
 // this the divergence is permanent. Re-claim on a deadline, a bounded number of times.
@@ -277,6 +289,27 @@ bool SlotEquals(const Slot& a, const Slot& b) {
     return a.st.floppyType == b.st.floppyType && a.st.readWrites == b.st.readWrites &&
            a.st.zip == b.st.zip && a.c.nametype == b.c.nametype &&
            a.c.objectData == b.c.objectData && a.c.data == b.c.data;
+}
+
+bool ApplySlot(FS::DeviceKind kind, size_t index, void* device, const Slot& s);
+
+// CLIENT: apply every staged host value whose target now exists. A value that arrived before
+// servers[] was ready remains staged; a later canonical for the same device supersedes it. The
+// initial-canonical gate opens only after a host value was actually reconciled with a live device,
+// never merely because bytes arrived.
+void DrainPendingCanonicals(FS::DeviceKind kind, const std::vector<void*>& devices) {
+    for (auto it = g_pendingCanonical.begin(); it != g_pendingCanonical.end();) {
+        const auto entryKind = static_cast<FS::DeviceKind>(it->first >> 16);
+        if (entryKind != kind) { ++it; continue; }
+        const size_t index = static_cast<uint16_t>(it->first);
+        if (index < devices.size() && devices[index] && R::IsLive(devices[index])) {
+            ApplySlot(kind, index, devices[index], it->second);
+            g_haveCanonical = true;
+            it = g_pendingCanonical.erase(it);
+            continue;
+        }
+        ++it;
+    }
 }
 
 // Apply one slot to a live device and prime the shadow to what was written, so the next poll
@@ -491,8 +524,9 @@ void Tick() {
     const bool host = IsHost();
     if (host) DrainConnectRetries(s);
 
-    static std::vector<void*> devices;  // reused: the sweep must not allocate a list per second
+    static std::vector<void*> devices;  // reused: the sweep must not allocate a list per pass
     const size_t n = ReadDevices(kind, devices);
+    if (!host) DrainPendingCanonicals(kind, devices);
     for (size_t i = 0; i < n; ++i) {
         void* d = devices[i];
         if (!d || !R::IsLive(d)) continue;
@@ -539,17 +573,17 @@ void OnChunk(const coop::net::BlobChunkPayload& p, uint8_t senderSlot) {
         return;
     }
     const auto kind = static_cast<FS::DeviceKind>(kindB);
-    if (!FS::EnsureResolved(kind)) {
-        UE_LOGW("floppy_slot_sync: chunk arrived before %u resolved -- dropped (the 1 Hz sweep "
-                "and the connect set re-deliver)", static_cast<unsigned>(kindB));
-        return;
-    }
-    std::vector<void*> devices;
-    const size_t n = ReadDevices(kind, devices);
     const bool host = IsHost();
 
     if (op == kOpClaim) {
         if (!host) return;  // a client never takes another peer's claim; only the host's canonical
+        if (!FS::EnsureResolved(kind)) {
+            UE_LOGW("floppy_slot_sync: claim arrived before device kind %u resolved -- dropped; "
+                    "the client's answer deadline will retry it", static_cast<unsigned>(kindB));
+            return;
+        }
+        std::vector<void*> devices;
+        const size_t n = ReadDevices(kind, devices);
         if (blob.size() > kMaxSlotBytes) {
             UE_LOGW("floppy_slot_sync: claim from slot %u is %zu B, past the %zu B ceiling -- "
                     "dropped", static_cast<unsigned>(senderSlot), blob.size(), kMaxSlotBytes);
@@ -612,24 +646,40 @@ void OnChunk(const coop::net::BlobChunkPayload& p, uint8_t senderSlot) {
                 "dropped", static_cast<unsigned>(count), kMaxDevices);
         return;
     }
-    int applied = 0, skipped = 0, unchanged = 0;
+    std::vector<std::pair<uint8_t, Slot>> parsed;
+    parsed.reserve(count);
     for (uint16_t k = 0; k < count && r.ok; ++k) {
         const uint8_t index = r.U8();
         Slot in;
         if (!ParseSlot(r, in)) break;
-        if (index >= n || !devices[index] || !R::IsLive(devices[index])) { ++skipped; continue; }
-        if (!FS::IsSlotType(in.st.floppyType)) { ++skipped; continue; }
-        g_awaiting.erase(ShadowKey(kind, index));
-        if (ApplySlot(kind, index, devices[index], in)) ++applied;
-        else ++unchanged;
+        if (index >= kMaxDevices || !FS::IsSlotType(in.st.floppyType)) {
+            UE_LOGW("floppy_slot_sync: canonical carries invalid device=%u type=%d -- whole "
+                    "canonical dropped", static_cast<unsigned>(index), in.st.floppyType);
+            return;
+        }
+        parsed.emplace_back(index, std::move(in));
     }
-    if (!r.ok)
-        UE_LOGW("floppy_slot_sync: canonical truncated after %d of %u device(s)",
-                applied + unchanged + skipped, count);
-    g_haveCanonical = true;
-    if (applied || skipped)
-        UE_LOGI("floppy_slot_sync: CLIENT applied canonical -- %d device(s) written, %d already "
-                "matched, %d skipped (of %zu local)", applied, unchanged, skipped, n);
+    if (!r.ok || parsed.size() != count || r.off != blob.size()) {
+        UE_LOGW("floppy_slot_sync: malformed canonical (%zu of %u device(s), %zu trailing B) -- "
+                "whole canonical dropped", parsed.size(), count,
+                r.off <= blob.size() ? blob.size() - r.off : 0);
+        return;
+    }
+
+    for (auto& entry : parsed) {
+        const uint32_t key = ShadowKey(kind, entry.first);
+        g_awaiting.erase(key);
+        g_pendingCanonical[key] = std::move(entry.second);
+    }
+
+    std::vector<void*> devices;
+    if (FS::EnsureResolved(kind)) ReadDevices(kind, devices);
+    const size_t before = g_pendingCanonical.size();
+    DrainPendingCanonicals(kind, devices);
+    const size_t applied = before - g_pendingCanonical.size();
+    if (applied || !parsed.empty())
+        UE_LOGI("floppy_slot_sync: CLIENT canonical -- %zu device(s) reconciled, %zu staged until "
+                "their local targets exist", applied, g_pendingCanonical.size());
 }
 
 void QueueConnectBroadcastForSlot(int peerSlot) {
@@ -649,6 +699,7 @@ void OnDisconnect() {
     g_retry.clear();
     g_unsendable.clear();
     g_awaiting.clear();
+    g_pendingCanonical.clear();
     g_connectRetry.clear();
     g_haveCanonical = false;
     FS::ResetCache();
