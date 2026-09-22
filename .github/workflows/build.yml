@@ -20,9 +20,6 @@
 name: build
 
 on:
-  push:
-    branches:
-      - cursor/fix-floppy-desync-d19e
   workflow_dispatch:
     inputs:
       cacheless:
