@@ -5,22 +5,27 @@
 #include "coop/net/protocol.h"
 #include "coop/net/session.h"
 #include "coop/player/players_registry.h"
+#include "coop/props/prop_save_data.h"
 #include "coop/props/prop_sound.h"
 
+#include "ue_wrap/actors/prop.h"
 #include "ue_wrap/engine/engine.h"
 #include "ue_wrap/core/game_thread.h"
 #include "ue_wrap/core/log.h"
 #include "ue_wrap/core/reflection.h"
+#include "ue_wrap/core/script_gate.h"
 
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <string>
 
 namespace coop::inventory_pickup_sync {
 namespace {
 
 namespace R  = ue_wrap::reflection;
 namespace GT = ue_wrap::game_thread;
+namespace SG = ue_wrap::script_gate;
 
 std::atomic<coop::net::Session*> g_session{nullptr};
 
@@ -32,6 +37,42 @@ int32_t g_offPitch = -1;
 int32_t g_offWco   = -1;
 bool    g_observerRegistered = false;
 uint32_t g_resolveN = 0;  // ~1 Hz throttle on the resolve walk (Install runs per pump tick)
+
+// A successful putObjectInventory2 captures the actor's getData into the personal store and then
+// destroys that actor. The destroy alone used to cross the wire, leaving the host's mutable record
+// stale; a second player could therefore pocket a full mirror and later drop full food. Watch the
+// body rather than ProcessEvent so Blueprint-local calls are visible. Publishing on an attempt
+// that the inventory later refuses is harmless: it only refreshes this same keyed prop.
+constexpr const wchar_t* kPocketVerb = L"putObjectInventory2";
+constexpr int kPocketTag = 0x504F434B;  // 'POCK'
+bool g_pocketWatchRegistered = false;
+
+SG::Verdict OnPocketPre(const SG::Call& call) {
+    auto* s = g_session.load(std::memory_order_acquire);
+    if (!s || !s->connected() || !call.locals || !call.function) return SG::Verdict::Run;
+    void* local = coop::players::Registry::Get().Local();
+    if (!local || call.object != local) return SG::Verdict::Run;
+
+    static void* s_fn = nullptr;
+    static int32_t s_inputOff = -1;
+    if (s_fn != call.function) {
+        s_fn = call.function;
+        s_inputOff = R::FindParamOffset(call.function, L"InputPin");
+        if (s_inputOff < 0)
+            UE_LOGW("inventory_pickup: %ls InputPin did not resolve -- mutable pocket state "
+                    "cannot be published", kPocketVerb);
+    }
+    if (s_inputOff < 0) return SG::Verdict::Run;
+    void* actor = *reinterpret_cast<void* const*>(call.locals + s_inputOff);
+    if (!actor || !R::IsLive(actor) || !ue_wrap::prop::IsKeyedInteractable(actor))
+        return SG::Verdict::Run;
+    const std::wstring key = ue_wrap::prop::GetInteractableKeyString(actor);
+    if (key.empty() || key == L"None") return SG::Verdict::Run;
+    if (coop::prop_save_data::Publish(s, actor, key))
+        UE_LOGI("inventory_pickup: published mutable state before pocketing key='%ls' cls='%ls'",
+                key.c_str(), R::ClassNameOf(actor).c_str());
+    return SG::Verdict::Run;
+}
 
 // POST observer on UGameplayStatics::PlaySound2D, which dispatches at human-event rate game-wide
 // (UI clicks, 2D cues); the body is three cached-offset reads and compares, exiting on the first
@@ -71,6 +112,16 @@ void OnPlaySound2DPost(void* /*self*/, void* /*function*/, void* params) {
 
 void Install(coop::net::Session* session) {
     g_session.store(session, std::memory_order_release);
+
+    if (!g_pocketWatchRegistered &&
+        SG::WatchName(kPocketVerb, kPocketTag, &OnPocketPre, nullptr)) {
+        g_pocketWatchRegistered = true;
+        UE_LOGI("inventory_pickup: watching %ls at the script-body gate -- mutable item state "
+                "publishes before the personal-store capture", kPocketVerb);
+    }
+    SG::ResolvePendingNames();
+    if (session && session->running()) SG::SetEnabled(true);
+
     if (g_observerRegistered && g_inventoryCue) return;
 
     // Throttle the GUObjectArray walks to ~1 Hz until everything resolves

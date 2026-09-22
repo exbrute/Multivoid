@@ -55,9 +55,10 @@ std::atomic<bool>     g_verbsResolved{false};  // ResolveVerbs succeeded (read o
 std::atomic<bool>     g_seamReady{false};      // run_end_travel can cancel a run-ending travel
 
 // The ending that asked to travel, for the revive's line. Written at the cancel and read on the
-// next pump task, both on the game thread.
+// next pump task, both on the game thread. It is deliberately not cleared by OnSessionStart:
+// that callback runs on the timeline thread, and a concurrent std::wstring::clear was undefined
+// behaviour. Every pending revive overwrites it before publishing g_revivePending.
 std::wstring g_pendingAuthorClass;
-bool         g_pendingAuthorIsLocalPawn = false;
 
 // The readiness window. Every field here is ATOMIC, and not because two threads compete for it
 // in the steady state -- Tick owns them all and Tick is game-thread only -- but because the RESET
@@ -67,19 +68,16 @@ bool         g_pendingAuthorIsLocalPawn = false;
 // published through them, the drills only read the span, and what is being bought is a whole read
 // rather than an ordering. The four per-term stamps exist so the window's own line says WHICH term
 // the wait was spent on -- a total alone cannot be acted on, and this is the number a fix moves.
-// The module's OLDER per-session fields (`g_wasDead`, `g_cancelAtMs`, `g_reviveRanThisDeath`,
-// `g_screenCleanupLeft`, `g_pendingAuthorClass`) are plain and are reset down that same path: the
-// same race, pre-dating this window, and its root is that a game-thread module's per-session reset
-// is invoked from the session's thread rather than posted. Named here, not quietly inherited.
 std::atomic<uint64_t>  g_pawnFirstMs{0};
 std::atomic<long long> g_armReadyAfterPawnMs{-1};
 std::atomic<long long> g_tSeam{-1}, g_tVerbs{-1}, g_tSession{-1}, g_tDeadOff{-1};
 
-// Pump-side state, game thread only.
-bool  g_wasDead = false;
-bool  g_lastReviveOk = false;
-bool  g_reviveRanThisDeath = false;
-uint64_t g_cancelAtMs = 0;
+// Pump-side state is read on the game thread but reset by OnSessionStart on the timeline thread,
+// so each scalar is atomic. This reset used to race the death tick during a fast stop/restart.
+std::atomic<bool>     g_wasDead{false};
+std::atomic<bool>     g_lastReviveOk{false};
+std::atomic<bool>     g_reviveRanThisDeath{false};
+std::atomic<uint64_t> g_cancelAtMs{0};
 
 // The revive is six synchronous writes on one tick, so past a few ticks it is failure, not
 // slowness. While dead the player can neither pause nor quit, so this window has no manual
@@ -422,7 +420,7 @@ bool RunRevive(coop::net::Session& session, void* pawn) {
 // eighth of the walks.
 constexpr int kScreenCleanupTicks = 120;
 constexpr int kScreenCleanupStride = 8;
-int g_screenCleanupLeft = 0;
+std::atomic<int> g_screenCleanupLeft{0};
 
 // Re-attempt the three screen artifacts until they are provably gone; true when nothing is
 // left. Idempotent, one class lookup per artifact once clear.
@@ -463,8 +461,8 @@ long long ArmReadyAfterPawnMs() { return g_armReadyAfterPawnMs.load(std::memory_
 
 void NoteRunEndCancelled(void* author, const wchar_t* authorClass, bool authorIsLocalPawn) {
     (void)author;
+    (void)authorIsLocalPawn;
     g_pendingAuthorClass = authorClass ? authorClass : L"";
-    g_pendingAuthorIsLocalPawn = authorIsLocalPawn;
     g_revivePending.store(true, std::memory_order_release);
     // The clock is stamped at the cancel, not by the pump: the watchdog must bound "a travel was
     // cancelled and the pump never came back", and a deadline armed by the pump cannot bound a
@@ -486,8 +484,6 @@ void OnSessionStart() {
     g_lastReviveOk = false;
     g_cancelAtMs = 0;
     g_screenCleanupLeft = 0;
-    g_pendingAuthorClass.clear();
-    g_pendingAuthorIsLocalPawn = false;
 }
 
 void Tick(coop::net::Session& session, void* localPawn) {
@@ -657,7 +653,7 @@ void Watchdog() {
 }
 
 bool ArmedForThisDeath() { return g_armed.load(std::memory_order_acquire); }
-bool LastReviveSucceeded() { return g_lastReviveOk; }
+bool LastReviveSucceeded() { return g_lastReviveOk.load(std::memory_order_acquire); }
 
 bool ReconcileDisabled() {
     static const bool s = (coop::config::ReadEnv("VOTVCOOP_DEATH_NO_RECONCILE") == "1");
